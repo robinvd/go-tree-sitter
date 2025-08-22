@@ -106,20 +106,20 @@ type QueryMatch struct {
 
 // A sequence of [QueryMatch]es associated with a given [QueryCursor].
 type QueryMatches struct {
-	_inner  *C.TSQueryCursor
-	query   *Query
-	text    []byte
-	buffer1 []byte
-	buffer2 []byte
+	_inner   *C.TSQueryCursor
+	query    *Query
+	callback func(int, Point) []byte
+	buffer1  []byte
+	buffer2  []byte
 }
 
 // A sequence of [QueryCapture]s associated with a given [QueryCursor].
 type QueryCaptures struct {
-	_inner  *C.TSQueryCursor
-	query   *Query
-	text    []byte
-	buffer1 []byte
-	buffer2 []byte
+	_inner   *C.TSQueryCursor
+	query    *Query
+	callback func(int, Point) []byte
+	buffer1  []byte
+	buffer2  []byte
 }
 
 // A particular [Node] that has been captured with a particular name within a [Query].
@@ -749,13 +749,31 @@ func (qc *QueryCursor) DidExceedMatchLimit() bool {
 // one match may contain captures that appear *before* some of the
 // captures from a previous match.
 func (qc *QueryCursor) Matches(query *Query, node *Node, text []byte) QueryMatches {
+	return qc.MatchesWith(query, node, func(offset int, position Point) []byte {
+		if offset >= len(text) {
+			return []byte{}
+		}
+		return text[offset:]
+	})
+}
+
+// Iterate over all of the matches in the order that they were found, using a callback to provide text on demand.
+//
+// Each match contains the index of the pattern that matched, and a list of
+// captures. Because multiple patterns can match the same set of nodes,
+// one match may contain captures that appear *before* some of the
+// captures from a previous match. The callback function should return a slice
+// of UTF8-encoded text starting at the given byte offset and position.
+// If the given offset is at or beyond the end of the text, the callback
+// should return an empty slice.
+func (qc *QueryCursor) MatchesWith(query *Query, node *Node, callback func(int, Point) []byte) QueryMatches {
 	C.ts_query_cursor_exec(qc._inner, query._inner, node._inner)
 	qm := QueryMatches{
-		_inner:  qc._inner,
-		query:   query,
-		text:    text,
-		buffer1: []byte{},
-		buffer2: []byte{},
+		_inner:   qc._inner,
+		query:    query,
+		callback: callback,
+		buffer1:  []byte{},
+		buffer2:  []byte{},
 	}
 	if qm._inner != qc._inner {
 		panic("inner pointers of `QueryCursor` and `QueryMatches` are not equal")
@@ -791,12 +809,18 @@ func (qc *QueryCursor) MatchesWithOptions(query *Query, node *Node, text []byte,
 
 	C.ts_query_cursor_exec_with_options(qc._inner, query._inner, node._inner, cOptions)
 
+	callback := func(offset int, position Point) []byte {
+		if offset >= len(text) {
+			return []byte{}
+		}
+		return text[offset:]
+	}
 	qm := QueryMatches{
-		_inner:  qc._inner,
-		query:   query,
-		text:    text,
-		buffer1: []byte{},
-		buffer2: []byte{},
+		_inner:   qc._inner,
+		query:    query,
+		callback: callback,
+		buffer1:  []byte{},
+		buffer2:  []byte{},
 	}
 	if qm._inner != qc._inner {
 		panic("inner pointers of `QueryCursor` and `QueryMatches` are not equal")
@@ -814,13 +838,30 @@ func (qc *QueryCursor) MatchesWithOptions(query *Query, node *Node, text []byte,
 // This is useful if you don't care about which pattern matched, and just
 // want a single, ordered sequence of captures.
 func (qc *QueryCursor) Captures(query *Query, node *Node, text []byte) QueryCaptures {
+	return qc.CapturesWith(query, node, func(offset int, position Point) []byte {
+		if offset >= len(text) {
+			return []byte{}
+		}
+		return text[offset:]
+	})
+}
+
+// Iterate over all of the individual captures in the order that they
+// appear, using a callback to provide text on demand.
+//
+// This is useful if you don't care about which pattern matched, and just
+// want a single, ordered sequence of captures. The callback function
+// should return a slice of UTF8-encoded text starting at the given byte
+// offset and position. If the given offset is at or beyond the end of the
+// text, the callback should return an empty slice.
+func (qc *QueryCursor) CapturesWith(query *Query, node *Node, callback func(int, Point) []byte) QueryCaptures {
 	C.ts_query_cursor_exec(qc._inner, query._inner, node._inner)
 	return QueryCaptures{
-		_inner:  qc._inner,
-		query:   query,
-		text:    text,
-		buffer1: []byte{},
-		buffer2: []byte{},
+		_inner:   qc._inner,
+		query:    query,
+		callback: callback,
+		buffer1:  []byte{},
+		buffer2:  []byte{},
 	}
 }
 
@@ -914,8 +955,74 @@ func (qm *QueryMatch) NodesForCaptureIndex(captureIndex uint) []Node {
 	return nodes
 }
 
+// getTextForNode retrieves text for a node using the callback, making multiple
+// calls if necessary to get the complete node text
+func (qm *QueryMatch) getTextForNode(node Node, callback func(int, Point) []byte) []byte {
+	if callback == nil {
+		return []byte{}
+	}
+	
+	startByte := int(node.StartByte())
+	endByte := int(node.EndByte())
+	totalLength := endByte - startByte
+	
+	if totalLength == 0 {
+		return []byte{}
+	}
+	
+	result := make([]byte, 0, totalLength)
+	currentByte := startByte
+	currentPosition := node.StartPosition()
+	
+	for len(result) < totalLength {
+		chunk := callback(currentByte, currentPosition)
+		if len(chunk) == 0 {
+			// No more data available, return what we have
+			break
+		}
+		
+		// Take only what we need
+		remainingNeeded := totalLength - len(result)
+		if len(chunk) > remainingNeeded {
+			chunk = chunk[:remainingNeeded]
+		}
+		
+		result = append(result, chunk...)
+		
+		// Update position for next callback
+		if len(result) < totalLength {
+			currentByte += len(chunk)
+			// Update position by counting newlines in the chunk we just consumed
+			for _, b := range chunk {
+				if b == '\n' {
+					currentPosition.Row++
+					currentPosition.Column = 0
+				} else {
+					currentPosition.Column++
+				}
+			}
+		}
+	}
+	
+	return result
+}
+
 func (qm *QueryMatch) SatisfiesTextPredicate(query *Query, buffer1, buffer2 []byte, text []byte) bool {
+	callback := func(offset int, position Point) []byte {
+		if offset >= len(text) {
+			return []byte{}
+		}
+		return text[offset:]
+	}
+	return qm.SatisfiesTextPredicateWith(query, buffer1, buffer2, callback)
+}
+
+func (qm *QueryMatch) SatisfiesTextPredicateWith(query *Query, buffer1, buffer2 []byte, callback func(int, Point) []byte) bool {
 	satisfies := true
+	
+	if len(query.TextPredicates[qm.PatternIndex]) == 0 {
+		return true // No text predicates, match succeeds
+	}
 
 	condition := func(predicate TextPredicateCapture) bool {
 		switch predicate.Type {
@@ -927,7 +1034,9 @@ func (qm *QueryMatch) SatisfiesTextPredicate(query *Query, buffer1, buffer2 []by
 			for len(nodes1) > 0 && len(nodes2) > 0 {
 				node1 := nodes1[0]
 				node2 := nodes2[0]
-				isPositiveMatch := bytes.Equal(text[node1.StartByte():node1.EndByte()], text[node2.StartByte():node2.EndByte()])
+				nodeText1 := qm.getTextForNode(node1, callback)
+				nodeText2 := qm.getTextForNode(node2, callback)
+				isPositiveMatch := bytes.Equal(nodeText1, nodeText2)
 				if isPositiveMatch != predicate.Positive && predicate.MatchAllNodes {
 					return false
 				}
@@ -944,7 +1053,7 @@ func (qm *QueryMatch) SatisfiesTextPredicate(query *Query, buffer1, buffer2 []by
 			s := predicate.Value.(string)
 			nodes := qm.NodesForCaptureIndex(i)
 			for _, node := range nodes {
-				nodeText := text[node.StartByte():node.EndByte()]
+				nodeText := qm.getTextForNode(node, callback)
 				isPositiveMatch := bytes.Equal(nodeText, []byte(s))
 				if isPositiveMatch != predicate.Positive && predicate.MatchAllNodes {
 					return false
@@ -961,7 +1070,7 @@ func (qm *QueryMatch) SatisfiesTextPredicate(query *Query, buffer1, buffer2 []by
 
 			nodes := qm.NodesForCaptureIndex(i)
 			for _, node := range nodes {
-				nodeText := text[node.StartByte():node.EndByte()]
+				nodeText := qm.getTextForNode(node, callback)
 				isPositiveMatch := r.Match(nodeText)
 				if isPositiveMatch != predicate.Positive && predicate.MatchAllNodes {
 					return false
@@ -976,7 +1085,7 @@ func (qm *QueryMatch) SatisfiesTextPredicate(query *Query, buffer1, buffer2 []by
 			v := predicate.Value.([]string)
 			nodes := qm.NodesForCaptureIndex(i)
 			for _, node := range nodes {
-				nodeText := text[node.StartByte():node.EndByte()]
+				nodeText := qm.getTextForNode(node, callback)
 				isPositiveMatch := false
 				for _, s := range v {
 					if bytes.Equal(nodeText, []byte(s)) {
@@ -1024,11 +1133,11 @@ func (qm *QueryMatches) Next() *QueryMatch {
 		defer C.free(unsafe.Pointer(m))
 		if C.ts_query_cursor_next_match(qm._inner, m) {
 			result := newQueryMatch(m, qm._inner)
-			if result.SatisfiesTextPredicate(
+			if result.SatisfiesTextPredicateWith(
 				qm.query,
 				qm.buffer1,
 				qm.buffer2,
-				qm.text,
+				qm.callback,
 			) {
 				return &result
 			}
@@ -1050,11 +1159,11 @@ func (qc *QueryCaptures) Next() (*QueryMatch, uint) {
 		var captureIndex C.uint32_t
 		if C.ts_query_cursor_next_capture(qc._inner, m, &captureIndex) {
 			result := newQueryMatch(m, qc._inner)
-			if result.SatisfiesTextPredicate(
+			if result.SatisfiesTextPredicateWith(
 				qc.query,
 				qc.buffer1,
 				qc.buffer2,
-				qc.text,
+				qc.callback,
 			) {
 				return &result, uint(captureIndex)
 			}
